@@ -24,7 +24,7 @@ on:
         required: false
         default: 'docker'
       clang:
-        description: '工具链：system14=apt clang-14（我们之前的配方）/ weebx19=WeebX-Clang 19.1.5（作者 zfdx123 的配方）'
+        description: '工具链：system14=apt clang-14 / weebx19=WeebX-Clang 19.1.5（作者 build.yml 所写）/ weebx17=WeebX-Clang 17.0.6（作者 2023 发布包 Image 实测用的 17.x 系）'
         required: false
         default: 'system14'
       ksu:
@@ -88,13 +88,19 @@ jobs:
           # 不依赖 GITHUB_PATH 的跨步骤顺序 —— 实测该顺序不可靠。
           echo "$HOME/llvm-bin" > "$HOME/toolchain-bin.txt"
 
-      - name: 安装 Clang（WeebX-Clang 19.1.5，作者配方，可选）
-        if: ${{ github.event.inputs.clang == 'weebx19' }}
+      - name: 安装 Clang（WeebX-Clang，作者配方，可选）
+        if: ${{ github.event.inputs.clang == 'weebx19' || github.event.inputs.clang == 'weebx17' }}
+        env:
+          # weebx17 = 作者 2023 正式发布包实测用的版本系（其 Image 版本串为 WeebX clang 17.0.0；
+          # 上游 release 里最接近的是 17.0.6）。weebx19 = 作者 build.yml 里写的 19.1.5。
+          WEEBX_TAG: ${{ github.event.inputs.clang == 'weebx17' && 'WeebX-Clang-17.0.6-release' || 'WeebX-Clang-19.1.5-release' }}
+          WEEBX_FILE: ${{ github.event.inputs.clang == 'weebx17' && 'WeebX-Clang-17.0.6.tar.gz' || 'WeebX-Clang-19.1.5.tar.gz' }}
+          WEEBX_MAJOR: ${{ github.event.inputs.clang == 'weebx17' && '17' || '19' }}
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/weebx"
           wget -q -O /tmp/weebx.tar.gz \
-            https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz
+            "https://github.com/XSans0/WeebX-Clang/releases/download/${WEEBX_TAG}/${WEEBX_FILE}"
           tar -C "$HOME/weebx" -zxf /tmp/weebx.tar.gz
           echo "== 解包后的顶层结构 =="
           find "$HOME/weebx" -maxdepth 3 -type d | head -20
@@ -112,10 +118,10 @@ jobs:
           echo "WeebX clang bin = $CLANG_BIN"
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
           echo "$CLANG_BIN" > "$HOME/toolchain-bin.txt"
-          echo "== WeebX 编译器自报版本（必须含 19）=="
+          echo "== WeebX 编译器自报版本（必须含 ${WEEBX_MAJOR}）=="
           "$CLANG_BIN/clang" --version | head -3
-          "$CLANG_BIN/clang" --version | head -1 | grep -q '19\.' \
-            || { echo "::error::WeebX clang 版本不是 19.x，作者配方未生效"; exit 1; }
+          "$CLANG_BIN/clang" --version | head -1 | grep -q "${WEEBX_MAJOR}\." \
+            || { echo "::error::WeebX clang 版本不是 ${WEEBX_MAJOR}.x，作者配方未生效"; exit 1; }
           ls "$CLANG_BIN" | grep -E '^(ld\.lld|llvm-ar|llvm-objcopy|llvm-strip|llvm-nm)$' | sort
 
       - name: 克隆内核源码（锁定到已验证的 commit）
@@ -179,6 +185,10 @@ jobs:
           #   drivers/Kconfig:240: can't open file "drivers/kernelsu/Kconfig"
           # 而我们不带 KSU 复刻老树（只为验证"老内核树能否开机"），
           # 所以这里造一个最小占位 Kconfig/Kbuild/Makefile，把引用喂饱即可。
+          # v4.19.296 里 drivers/kernelsu 是个指向 ../KernelSU/kernel 的**符号链接**，
+          # 未克隆 KernelSU 时它是悬空链接 → `mkdir -p` 会报 "File exists"（实测踩到）。
+          # 先删掉它，再建占位目录。
+          rm -rf kernel-src/drivers/kernelsu
           mkdir -p kernel-src/drivers/kernelsu
           printf '%s\n' '# 占位（ksu=stub）：不提供任何 KernelSU 功能，仅为满足 drivers/Kconfig 的 source 引用。' > kernel-src/drivers/kernelsu/Kconfig
           printf '%s\n' '# 占位（ksu=stub）' > kernel-src/drivers/kernelsu/Kbuild
