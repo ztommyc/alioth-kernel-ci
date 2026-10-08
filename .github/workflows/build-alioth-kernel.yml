@@ -84,21 +84,38 @@ jobs:
           ln -sf /usr/bin/ld.lld-14 "$HOME/llvm-bin/ld.lld"
           echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
           "$HOME/llvm-bin/clang" --version | head -2 || clang-14 --version | head -2
+          # 把本次选用的工具链目录落到文件里，后续每个 make 步骤显式注入 PATH。
+          # 不依赖 GITHUB_PATH 的跨步骤顺序 —— 实测该顺序不可靠。
+          echo "$HOME/llvm-bin" > "$HOME/toolchain-bin.txt"
 
       - name: 安装 Clang（WeebX-Clang 19.1.5，作者配方，可选）
         if: ${{ github.event.inputs.clang == 'weebx19' }}
         run: |
-          set -eux
+          set -euxo pipefail
           mkdir -p "$HOME/weebx"
           wget -q -O /tmp/weebx.tar.gz \
             https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz
           tar -C "$HOME/weebx" -zxf /tmp/weebx.tar.gz
-          CLANG_BIN="$(dirname "$(find "$HOME/weebx" -maxdepth 3 -name clang -type f | head -1)")"
-          [ -n "$CLANG_BIN" ] || { echo "::error::未在 WeebX 包中找到 clang"; exit 1; }
+          echo "== 解包后的顶层结构 =="
+          find "$HOME/weebx" -maxdepth 3 -type d | head -20
+          # 坑（第一版就栽在这里）：clang 在包的 bin/ 下**多为符号链接**，
+          #   find -type f 会找不到 → 返回空 → dirname "" == "." → 守卫 [ -n "." ] 照样通过
+          #   → 把「当前目录」塞进 PATH → 悄悄退回系统 clang-14（而 | head 吞掉退出码，
+          #     set -e 也不报错）。因此这里放开类型限制、加深度、并按「可执行」校验。
+          CLANG_BIN="$(find "$HOME/weebx" -maxdepth 5 \( -name clang -o -name 'clang-[0-9]*' \) \
+                        \( -type f -o -type l \) -print -quit | xargs -r dirname)"
+          if [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "::error::未在 WeebX 包中找到可执行的 clang（CLANG_BIN='$CLANG_BIN'）"
+            find "$HOME/weebx" -maxdepth 5 -name 'clang*' | head -20 || true
+            exit 1
+          fi
           echo "WeebX clang bin = $CLANG_BIN"
-          # 后写入 GITHUB_PATH 的条目优先级更高，因此会盖过上面的 llvm-bin
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          echo "$CLANG_BIN" > "$HOME/toolchain-bin.txt"
+          echo "== WeebX 编译器自报版本（必须含 19）=="
           "$CLANG_BIN/clang" --version | head -3
+          "$CLANG_BIN/clang" --version | head -1 | grep -q '19\.' \
+            || { echo "::error::WeebX clang 版本不是 19.x，作者配方未生效"; exit 1; }
           ls "$CLANG_BIN" | grep -E '^(ld\.lld|llvm-ar|llvm-objcopy|llvm-strip|llvm-nm)$' | sort
 
       - name: 克隆内核源码（锁定到已验证的 commit）
@@ -165,6 +182,12 @@ jobs:
         run: |
           set -eux
           cd kernel-src
+          # 显式注入本次选用的工具链（不依赖 GITHUB_PATH 的跨步骤顺序）
+          CLANG_DIR="$(cat "$HOME/toolchain-bin.txt")"
+          export PATH="$CLANG_DIR:$PATH"
+          echo "== 本次实际使用的编译器 =="
+          command -v clang; clang --version | head -1
+          command -v ld.lld; ld.lld --version | head -1
           # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
           # 原因：v4.19.296 一系的 Makefile 无条件写死
           #   CC = $(PYTHON2) $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
@@ -185,6 +208,8 @@ jobs:
         run: |
           set -eux
           cd kernel-src
+          CLANG_DIR="$(cat "$HOME/toolchain-bin.txt")"; export PATH="$CLANG_DIR:$PATH"
+          command -v clang; clang --version | head -1
           scripts/kconfig/merge_config.sh -m -O out out/.config \
             ../ci/config/docker-kernel.fragment
           # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
@@ -237,6 +262,10 @@ jobs:
         run: |
           set -eux
           cd kernel-src
+          CLANG_DIR="$(cat "$HOME/toolchain-bin.txt")"
+          export PATH="$CLANG_DIR:$PATH"
+          echo "== 编译所用编译器 =="
+          command -v clang; clang --version | head -1
           # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
           # 原因：v4.19.296 一系的 Makefile 无条件写死
           #   CC = $(PYTHON2) $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
@@ -256,6 +285,7 @@ jobs:
         run: |
           set -eux
           cd kernel-src
+          CLANG_DIR="$(cat "$HOME/toolchain-bin.txt")"; export PATH="$CLANG_DIR:$PATH"
           mkdir -p ../artifacts
           cp out/arch/arm64/boot/Image ../artifacts/Image
           [ -f out/arch/arm64/boot/Image.gz ] && cp out/arch/arm64/boot/Image.gz ../artifacts/ || true
@@ -288,6 +318,13 @@ jobs:
           echo "== 内核版本串与 vermagic =="
           strings ../artifacts/Image | grep -m1 "Linux version" || true
           strings ../artifacts/Image | grep -m1 "4\.19\..* SMP" || true
+          # 硬闸门：要求了 weebx19 就必须在版本串里看到 19.x，否则说明工具链没生效
+          # （注意不能用 "19\." 匹配 —— 会被内核版本号 4.19.325 里的 "19." 骗过）
+          if [ "${{ github.event.inputs.clang }}" = "weebx19" ]; then
+            strings ../artifacts/Image | grep -m1 "Linux version" | grep -qE 'clang version 19|19\.1\.5' \
+              || { echo "::error::要求 weebx19，但内核版本串里没有 clang 19.x —— 工具链未生效"; exit 1; }
+            echo "工具链闸门通过：内核确由 clang 19.x 编译 ✅"
+          fi
 
       - name: 收集编译出的内核模块
         run: |
