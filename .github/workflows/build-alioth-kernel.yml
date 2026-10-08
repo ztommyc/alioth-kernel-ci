@@ -19,6 +19,10 @@ on:
         description: '内核树 commit（留空 = 使用已验证的锁定版本）'
         required: false
         default: ''
+      mode:
+        description: '构建模式：docker=打补丁+合并容器配置片段 / clean=原厂 defconfig 干净对照（不补丁不合并，用于定位内核起不来的原因）'
+        required: false
+        default: 'docker'
 
 permissions:
   contents: read
@@ -33,6 +37,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: ci
+
+      - name: 声明构建模式
+        run: |
+          M="${{ github.event.inputs.mode }}"
+          [ -n "$M" ] || M=docker
+          echo "构建模式: $M"
+          if [ "$M" = "clean" ]; then
+            echo "→ 干净对照：不应用模块兼容补丁、不合并 Docker 配置片段、跳过配置闸门"
+            echo "  目的：判断内核起不来是「内核树/工具链」问题还是「我们的补丁与配置」问题"
+          else
+            echo "→ Docker 模式：应用模块补丁 + 合并容器配置片段 + 配置闸门"
+          fi
 
       - name: 安装构建依赖与 Clang 工具链
         run: |
@@ -72,6 +88,7 @@ jobs:
           head -5 Makefile
 
       - name: 应用模块兼容补丁
+        if: ${{ github.event.inputs.mode != 'clean' }}
         run: |
           set -eux
           cd kernel-src
@@ -100,6 +117,7 @@ jobs:
             ${{ github.event.inputs.defconfig || 'alioth_defconfig' }}
 
       - name: 合并 Docker 能力配置片段
+        if: ${{ github.event.inputs.mode != 'clean' }}
         run: |
           set -eux
           cd kernel-src
@@ -111,6 +129,7 @@ jobs:
             olddefconfig
 
       - name: 配置校验闸门（关键项缺失则中止构建）
+        if: ${{ github.event.inputs.mode != 'clean' }}
         run: |
           set -eu
           cd kernel-src
