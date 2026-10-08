@@ -23,6 +23,14 @@ on:
         description: '构建模式：docker=打补丁+合并容器配置片段 / clean=原厂 defconfig 干净对照（不补丁不合并，用于定位内核起不来的原因）'
         required: false
         default: 'docker'
+      clang:
+        description: '工具链：system14=apt clang-14（我们之前的配方）/ weebx19=WeebX-Clang 19.1.5（作者 zfdx123 的配方）'
+        required: false
+        default: 'system14'
+      ksu:
+        description: 'KernelSU 集成：no=不集成 / setup=克隆 ReSukiSU 并跑 setup.sh 生成 drivers/kernelsu（v4.19.296 等老树必需，否则 Kconfig 报缺文件）'
+        required: false
+        default: 'no'
 
 permissions:
   contents: read
@@ -58,7 +66,15 @@ jobs:
             clang-14 lld-14 llvm-14 \
             binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             bc bison flex libssl-dev libelf-dev cpio kmod \
-            python3 python3-pip zip unzip xz-utils
+            python3 python3-pip zip unzip xz-utils wget \
+            python2 || true
+          # 老内核树（v4.19.296 一系）的 Kconfig/版本探测脚本会调用 python2；
+          # ubuntu-22.04 上若装不到 python2，就做一个指向 python3 的垫片。
+          if ! command -v python2 >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v python3)" /usr/local/bin/python2
+            echo "python2 缺失，已创建指向 python3 的垫片"
+          fi
+          echo "python2 -> $(command -v python2)"; (python2 --version 2>&1 | head -1) || true
           # 把带版本号的 clang 工具链软链成内核 LLVM=1 所期望的名字
           mkdir -p "$HOME/llvm-bin"
           for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
@@ -68,6 +84,22 @@ jobs:
           ln -sf /usr/bin/ld.lld-14 "$HOME/llvm-bin/ld.lld"
           echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
           "$HOME/llvm-bin/clang" --version | head -2 || clang-14 --version | head -2
+
+      - name: 安装 Clang（WeebX-Clang 19.1.5，作者配方，可选）
+        if: ${{ github.event.inputs.clang == 'weebx19' }}
+        run: |
+          set -eux
+          mkdir -p "$HOME/weebx"
+          wget -q -O /tmp/weebx.tar.gz \
+            https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz
+          tar -C "$HOME/weebx" -zxf /tmp/weebx.tar.gz
+          CLANG_BIN="$(dirname "$(find "$HOME/weebx" -maxdepth 3 -name clang -type f | head -1)")"
+          [ -n "$CLANG_BIN" ] || { echo "::error::未在 WeebX 包中找到 clang"; exit 1; }
+          echo "WeebX clang bin = $CLANG_BIN"
+          # 后写入 GITHUB_PATH 的条目优先级更高，因此会盖过上面的 llvm-bin
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          "$CLANG_BIN/clang" --version | head -3
+          ls "$CLANG_BIN" | grep -E '^(ld\.lld|llvm-ar|llvm-objcopy|llvm-strip|llvm-nm)$' | sort
 
       - name: 克隆内核源码（锁定到已验证的 commit）
         env:
@@ -86,6 +118,28 @@ jobs:
           git rev-parse HEAD
           echo "== 内核版本 =="
           head -5 Makefile
+
+      - name: 集成 KernelSU（ReSukiSU，老内核树必需）
+        if: ${{ github.event.inputs.ksu == 'setup' }}
+        env:
+          DEFCONFIG: ${{ github.event.inputs.defconfig || 'alioth_defconfig' }}
+        run: |
+          set -eux
+          # v4.19.296 一系的内核树里 drivers/Kconfig 引用了 drivers/kernelsu/Kconfig，
+          # 而该目录由 KernelSU 的 setup.sh 生成 —— 不跑这一步，make <defconfig> 必失败：
+          #   drivers/Kconfig:240: can't open file "drivers/kernelsu/Kconfig"
+          # 这也是作者 zfdx123 自己构建库（build-k40-ksu）里的做法。
+          git clone -q --depth 1 https://github.com/ReSukiSU/ReSukiSU kernel-src/KernelSU
+          cd kernel-src
+          echo "== ReSukiSU 版本 =="
+          git -C KernelSU rev-parse --short HEAD
+          for k in CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y; do
+            grep -qx "$k" "arch/arm64/configs/$DEFCONFIG" || echo "$k" >> "arch/arm64/configs/$DEFCONFIG"
+          done
+          sh ./KernelSU/kernel/setup.sh
+          echo "== drivers/kernelsu 集成结果 =="
+          ls -l drivers/kernelsu/Kconfig
+          grep -n "kernelsu" drivers/Kconfig | head -3
 
       - name: 应用模块兼容补丁
         if: ${{ github.event.inputs.mode != 'clean' }}
