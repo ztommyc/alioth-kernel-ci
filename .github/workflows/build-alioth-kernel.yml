@@ -150,13 +150,22 @@ jobs:
           cd kernel-src
           echo "== ReSukiSU 版本 =="
           git -C KernelSU rev-parse --short HEAD
-          for k in CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y; do
+          for k in CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y \
+                   CONFIG_KALLSYMS_ALL=y; do
             grep -qx "$k" "arch/arm64/configs/$DEFCONFIG" || echo "$k" >> "arch/arm64/configs/$DEFCONFIG"
           done
           sh ./KernelSU/kernel/setup.sh
           echo "== drivers/kernelsu 集成结果 =="
           ls -l drivers/kernelsu/Kconfig
           grep -n "kernelsu" drivers/Kconfig | head -3
+          # ReSukiSU main 现在已是 BakaSU v4.2.0-rc3，其 kernel/tools/static_export_check.mk
+          # 会在编译期强制要求：要么 CONFIG_KALLSYMS_ALL=y，要么手工在 selinuxfs.c 里
+          # 导出 sel_handle_status_ops。缺一即报：
+          #   *** You should integrate BakaSU in your kernel. Stop.
+          #   make[2]: *** [drivers/kernelsu] Error 2
+          # 作者 2023 年发布时用的是老版 KernelSU，还没有这个检查。这里补上 KALLSYMS_ALL。
+          grep -qx 'CONFIG_KALLSYMS_ALL=y' "arch/arm64/configs/$DEFCONFIG" \
+            && echo "已为 BakaSU 静态导出检查补上 CONFIG_KALLSYMS_ALL=y ✅"
 
       - name: 应用模块兼容补丁
         if: ${{ github.event.inputs.mode != 'clean' }}
