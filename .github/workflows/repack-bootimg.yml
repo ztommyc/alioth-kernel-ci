@@ -1,0 +1,100 @@
+name: Repack boot.img (from an existing build)
+
+# 用途：复用「Build alioth kernel」某一次 Run 的编译产物，配合仓库里的 stock_boot.img，
+#      用 magiskboot 重新打包出可直接 fastboot flash 的 boot.img。
+# 好处：不需要为了重打包而重新编译内核（省掉约 1 小时）。
+#
+# 使用前置条件：
+#   1) 仓库根目录已有 stock_boot.img（原厂 boot 镜像）
+#   2) 已知「Build alioth kernel」成功 Run 的 run_id（Run 页面 URL 里的数字，如 .../actions/runs/1234567890）
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '来源 Run ID（Build alioth kernel 那次成功构建的 run_id）'
+        required: true
+      base:
+        description: '基准 boot 镜像文件名（仓库根目录下的文件）'
+        required: false
+        default: 'stock_boot.img'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出本仓库（取 stock_boot.img）
+        uses: actions/checkout@v4
+
+      - name: 校验基准镜像存在
+        run: |
+          set -eu
+          if [ ! -f "${{ github.event.inputs.base }}" ]; then
+            echo "::error:: 仓库根目录未找到 ${{ github.event.inputs.base }}"
+            exit 1
+          fi
+          ls -lh "${{ github.event.inputs.base }}"
+
+      - name: 从指定 Run 下载编译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: alioth-docker-kernel
+          run-id: ${{ github.event.inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          path: artifacts
+
+      - name: 确认产物内容
+        run: |
+          set -eux
+          find artifacts -maxdepth 3 -type f | head -30
+          test -f artifacts/Image || { echo "::error:: 产物里没有 Image"; exit 1; }
+
+      - name: 获取 magiskboot
+        run: |
+          set -eux
+          curl -sL -o Magisk.apk \
+            https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+          mkdir -p mb
+          unzip -o -j Magisk.apk 'lib/x86_64/libmagiskboot.so' -d mb
+          chmod +x mb/libmagiskboot.so
+          ./mb/libmagiskboot.so --help | head -5 || true
+
+      - name: 用 magiskboot 重打包
+        run: |
+          set -eux
+          mkdir -p work && cd work
+          cp "../${{ github.event.inputs.base }}" boot.img
+          ../mb/libmagiskboot.so unpack boot.img
+          echo "== 解包结果 =="
+          ls -l
+          echo "== 原厂内核大小 =="
+          ls -l kernel 2>/dev/null || echo "(无 kernel 段)"
+          cp ../artifacts/Image kernel
+          ../mb/libmagiskboot.so repack boot.img
+          ls -lh new-boot.img
+          mkdir -p ../out
+          cp new-boot.img ../out/boot.img
+
+      - name: 记录内核版本串
+        run: |
+          set -eu
+          echo "== 新 boot.img 中的内核版本 =="
+          strings out/boot.img | grep -m3 "Linux version" || true
+          echo
+          echo "== 产物大小 =="
+          ls -lh out/
+
+      - name: 上传 boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-boot-img
+          path: out/boot.img
+          if-no-files-found: error
+          retention-days: 30

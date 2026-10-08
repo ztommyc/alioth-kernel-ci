@@ -1,0 +1,182 @@
+name: Build alioth kernel (Docker-enabled)
+
+# 在 GitHub 云端 Ubuntu 上编译支持 Docker 的 alioth 内核
+# 产出：Image / Image.gz / 全部 .ko 模块 / 合并后的 .config
+# 若仓库根目录存在 stock_boot.img，还会自动用 magiskboot 重新打包出可直接刷入的 boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: '使用哪个 defconfig'
+        required: false
+        default: 'alioth_defconfig'
+      repack:
+        description: '是否用 stock_boot.img 重打包 boot.img (auto/yes/no)'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: 检出本仓库（CI 配置）
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: 安装构建依赖与 Clang 工具链
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang-14 lld-14 llvm-14 \
+            binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            bc bison flex libssl-dev libelf-dev cpio kmod \
+            python3 python3-pip zip unzip xz-utils
+          # 把带版本号的 clang 工具链软链成内核 LLVM=1 所期望的名字
+          mkdir -p "$HOME/llvm-bin"
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                   llvm-objdump llvm-readelf llvm-size llvm-strip llvm-as; do
+            if [ -x "/usr/bin/${t}-14" ]; then ln -sf "/usr/bin/${t}-14" "$HOME/llvm-bin/$t"; fi
+          done
+          ln -sf /usr/bin/ld.lld-14 "$HOME/llvm-bin/ld.lld"
+          echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
+          "$HOME/llvm-bin/clang" --version | head -2 || clang-14 --version | head -2
+
+      - name: 克隆内核源码
+        run: |
+          set -eux
+          git clone --depth 1 --branch master \
+            https://github.com/zfdx123/kernel_xiaomi_alioth.git kernel-src
+          cd kernel-src
+          echo "== 内核版本 =="
+          head -5 Makefile
+
+      - name: 应用模块兼容补丁
+        run: |
+          set -eux
+          cd kernel-src
+          python3 ../ci/scripts/patch-module-compat.py
+          echo "== 校验补丁已生效 =="
+          grep -n "alioth-docker-patch" kernel/module.c
+
+      - name: 生成 base defconfig
+        run: |
+          set -eux
+          cd kernel-src
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            ${{ github.event.inputs.defconfig || 'alioth_defconfig' }}
+
+      - name: 合并 Docker 能力配置片段
+        run: |
+          set -eux
+          cd kernel-src
+          scripts/kconfig/merge_config.sh -m -O out out/.config \
+            ../ci/config/docker-kernel.fragment
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            olddefconfig
+
+      - name: 配置校验闸门（关键项缺失则中止构建）
+        run: |
+          set -eu
+          cd kernel-src
+          FAIL=0
+          echo "===== 致命项（Docker 必需）====="
+          for k in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_CGROUP_DEVICE \
+                   CONFIG_NET_NS CONFIG_OVERLAY_FS; do
+            if grep -qx "${k}=y" out/.config; then echo "  [OK]   $k"; else echo "  [FAIL] $k"; FAIL=1; fi
+          done
+          echo "===== 重要项 ====="
+          for k in CONFIG_USER_NS CONFIG_CGROUP_PIDS CONFIG_IPC_NS \
+                   CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE; do
+            if grep -qx "${k}=y" out/.config; then echo "  [OK]   $k"; else echo "  [FAIL] $k"; FAIL=1; fi
+          done
+          echo "===== 基础项 ====="
+          for k in CONFIG_MEMCG CONFIG_CGROUP_SCHED CONFIG_CGROUP_FREEZER \
+                   CONFIG_BRIDGE CONFIG_VETH CONFIG_NF_NAT \
+                   CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_SECCOMP CONFIG_BLK_DEV_LOOP; do
+            if grep -qx "${k}=y" out/.config; then echo "  [OK]   $k"; else echo "  [FAIL] $k"; FAIL=1; fi
+          done
+          echo "===== Root 支持（ReSukiSU manual hook）====="
+          grep -E "^CONFIG_(KSU|KALLSYMS_ALL)" out/.config || echo "  (未找到 KSU 相关配置，请人工确认)"
+          if [ "$FAIL" = "1" ]; then
+            echo "::error:: 关键配置缺失，中止构建（避免产出无用的内核）"
+            exit 1
+          fi
+          echo "全部关键配置校验通过 ✅"
+
+      - name: 编译内核
+        run: |
+          set -eux
+          cd kernel-src
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            -j"$(nproc)"
+
+      - name: 收集产物
+        run: |
+          set -eux
+          cd kernel-src
+          mkdir -p ../artifacts
+          cp out/arch/arm64/boot/Image ../artifacts/Image
+          [ -f out/arch/arm64/boot/Image.gz ] && cp out/arch/arm64/boot/Image.gz ../artifacts/ || true
+          cp out/.config ../artifacts/kernel.config
+          echo "== 产物清单 =="
+          ls -lh ../artifacts
+          echo "== 内核版本串与 vermagic =="
+          strings ../artifacts/Image | grep -m1 "Linux version" || true
+          strings ../artifacts/Image | grep -m1 "4\.19\..* SMP" || true
+
+      - name: 收集编译出的内核模块
+        run: |
+          set -eux
+          cd kernel-src
+          mkdir -p ../artifacts/modules
+          find out -name '*.ko' -exec cp {} ../artifacts/modules/ \; 2>/dev/null || true
+          echo "模块数量: $(ls -1 ../artifacts/modules 2>/dev/null | wc -l)"
+
+      - name: 用 magiskboot 重打包 boot.img
+        id: repack
+        if: ${{ github.event.inputs.repack != 'no' }}
+        run: |
+          set -eu
+          if [ ! -f ci/stock_boot.img ]; then
+            echo "未发现 ci/stock_boot.img，跳过重打包（只产出 Image）"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set -eux
+          # 取 magiskboot（Magisk APK 内含 Linux x86_64 版本）
+          curl -sL -o Magisk.apk \
+            https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+          mkdir -p mb && unzip -o -j Magisk.apk 'lib/x86_64/libmagiskboot.so' -d mb
+          chmod +x mb/libmagiskboot.so
+          cd kernel-src
+          mkdir -p ../repack && cd ../repack
+          cp ../ci/stock_boot.img boot.img
+          ../mb/libmagiskboot.so unpack boot.img
+          ls -l
+          cp ../artifacts/Image kernel
+          ../mb/libmagiskboot.so repack boot.img
+          cp new-boot.img ../artifacts/boot.img
+          ls -lh ../artifacts/boot.img
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-docker-kernel
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30

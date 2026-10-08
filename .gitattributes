@@ -1,0 +1,2 @@
+# 强制所有文本文件以 LF 存储，避免 Windows 上的 CRLF 污染 bash / Kconfig
+* text=auto eol=lf
