@@ -176,6 +176,34 @@ jobs:
           cp out/arch/arm64/boot/Image ../artifacts/Image
           [ -f out/arch/arm64/boot/Image.gz ] && cp out/arch/arm64/boot/Image.gz ../artifacts/ || true
           cp out/.config ../artifacts/kernel.config
+
+          # ---- dtbo.img：设备树 overlay，必须随内核一起刷 ----
+          # 内核驱动的 DTS binding 与出厂 dtbo 里的 DTB 可能不一致，
+          # 只换内核不换 dtbo 会导致关键驱动（UFS/显示）起不来，卡在开机 logo。
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img ../artifacts/dtbo.img
+            echo "== dtbo.img 已收集 =="
+            ls -l ../artifacts/dtbo.img
+            echo "-- 内含 DTB 条目数（DT table header）--"
+            python3 - <<'PY'
+            import struct
+            b = open('../artifacts/dtbo.img','rb').read()
+            magic, total, hsz, esz, ecnt, eoff, psz, ver = struct.unpack('>8I', b[:32])
+            print(f'  magic=0x{magic:08x} entries={ecnt} total={total} page={psz}')
+            names = []
+            for i in range(ecnt):
+                off = eoff + i*esz
+                ds, do = struct.unpack('>II', b[off:off+8])
+                blob = b[do:do+ds]
+                k = blob.find(b'xiaomi alioth')
+                names.append('alioth' if k != -1 else '.')
+            print('  alioth 条目:', names.count('alioth'), '/', ecnt)
+            PY
+          else
+            echo "::error::未生成 dtbo.img —— 内核树的 DTS 可能未被编译，检查 CONFIG_BUILD_ARM64_DT_OVERLAY"
+            exit 1
+          fi
+
           echo "== 产物清单 =="
           ls -lh ../artifacts
           echo "== 内核版本串与 vermagic =="

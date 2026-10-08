@@ -45,3 +45,29 @@ CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_DEVTMPFS=y
 CONFIG_FUSE_FS=y
 CONFIG_AIO=y
+
+# ============================================================
+# 与「能否正常启动 / 能否带动原厂 vendor 模块」直接相关的修正
+# 依据：2026-10-08 原厂内核配置 vs 自编内核配置逐项比对
+# ============================================================
+
+# —— 模块签名 ——
+# alioth_defconfig 自带 MODULE_SIG + MODULE_SIG_FORCE=y，而原厂内核
+# 是 "# CONFIG_MODULE_SIG is not set"。开着 FORCE 会导致：
+#   ① vendor_boot 里原厂签名的模块（显示/UFS/音频/WiFi）全部拒载；
+#   ② 本仓库 scripts/patch-module-compat.py 对 vermagic 的修补完全失效
+#      （签名校验发生在 check_modinfo 之前，先失败就退出）。
+# 因此这里显式关闭，与原厂行为对齐。
+# CONFIG_MODULE_SIG is not set
+
+# —— 启动诊断 ——
+# 原厂为 =y，alioth_defconfig 未包含。没有串口控制台时，
+# 内核早期崩溃不会在 pstore/ramoops 里留下任何日志。
+CONFIG_SERIAL_MSM_GENI_CONSOLE=y
+CONFIG_PSTORE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_PSTORE_CONSOLE=y
+
+# —— 触屏（原厂为 =y，alioth_defconfig 缺失，不补会导致触屏失效）——
+CONFIG_TOUCHSCREEN_SYNAPTICS_TCM=y
+CONFIG_TOUCHSCREEN_SYNAPTICS_TCM_I2C=y
