@@ -114,7 +114,7 @@ git push -u origin main
 | 输入项 | 填什么 |
 |---|---|
 | `defconfig` | 留空即可（默认 `alioth_defconfig`） |
-| `repack` | 留空（默认 `auto`，没有 `stock_boot.img` 时会自动跳过重打包） |
+| `repack` | 留空（默认 `auto`；仓库已有 `stock_boot.img`，会自动重打包出 `boot.img`） |
 | `kernel_ref` | **留空**（使用已验证锁定的 commit；仅在需要换内核版本时填写其它 commit） |
 
 耗时约 **40–90 分钟**。
@@ -142,7 +142,7 @@ git push -u origin main
 ```
 Image               ← 内核本体（重打包 boot.img 时用这个）
 Image.gz            ← 压缩版（如果生成）
-boot.img            ← 可直接刷入（前提：仓库里有 stock_boot.img）
+boot.img            ← 可直接刷入（由 stock_boot.img 重打包而来）
 kernel.config       ← 合并后的完整配置，可作为编译证据留存
 modules/*.ko        ← 编译出的内核模块（策略一要用）
 ```
@@ -151,35 +151,59 @@ modules/*.ko        ← 编译出的内核模块（策略一要用）
 
 ## 4. 生成可刷入的 boot.img
 
-仓库里**没有** `stock_boot.img` 时，构建只产出 `Image`。拿到可直接 `fastboot flash` 的 `boot.img` 有三种做法。
+仓库根目录已随工程提供 `stock_boot.img`（从官方线刷包提取的原厂 boot 镜像），因此**构建时会自动重打包出 `boot.img`**，无需额外操作。
 
-### 做法一：独立重打包工作流（推荐 —— 不重新编译）
+### 关于 stock_boot.img 的两个已验证事实
+
+**① 它已被裁剪到真实长度 70,438,912 字节（67.18 MiB）**
+
+线刷包里的 `images/boot.img` 是 **134,217,728 字节（128 MiB，正好等于 boot 分区大小）**，但真正属于 boot 镜像的只有前 67.18 MiB：
+
+| 区间（字节） | 内容 |
+|---|---|
+| `[0, 70438912)` | **boot 镜像本体** = header 4096 + kernel 50,581,504 + ramdisk 19,853,312 |
+| `[70438912, 70439808)` | chained vbmeta（896 字节 = 256 头 + 0 认证数据 + 640 辅助数据） |
+| `[70439808, 134217664)` | 零填充 |
+| `[134217664, 134217728)` | AVB footer（64 字节） |
+
+这个边界不是估算的——AVB footer 里自报的 `original_image_size = 70438912`，与按 kernel / ramdisk 分页推算出的长度**逐字节一致**，两条独立路径互证。裁剪掉零填充后仍是一个**完整合法的 boot image**（`ANDROID!` 魔数、header v3、`header + 分页 kernel + 分页 ramdisk` 长度自洽），因此能落在仓库 100 MB 单文件上限之内，无需分段。
+
+**② 为什么可以裁掉尾部那个 vbmeta**
+
+那段 chained vbmeta 记录的是**原镜像的哈希**，一旦替换内核必然失效。但你的 BL 已解锁（`flash.locked=0` / `verifiedbootstate=orange`），boot 分区的 AVB 校验本来就不执行，所以不影响启动——这正是 Magisk 能在解锁设备上正常工作的同一机制。
+
+> 完整 128 MiB 原始件已存档在 `backup/stock_boot.img`（本地，不入库），SHA-256 `745ef81b4f68fe7f10473cbc3bd84d3ac622110723ec6d0a2faec3d5dafcdd99`。
+
+### 完整性校验（强制）
+
+`stock_boot.img` 配了 `stock_boot.img.sha256`，两个工作流都会在**使用前强制校验**，缺校验文件或校验不过就直接中止——boot 镜像被改写一个字节就会刷不开机，这个闸门不能省。
+
+```
+0c7fff8281725bfbb47c1c820d874cb1a214f61af0e9e5eff2033dbb32b51188  stock_boot.img
+```
+
+重打包步骤还会额外做三项自检：基准镜像 `ANDROID!` 魔数、新镜像 `ANDROID!` 魔数、新镜像大小不得超过 boot 分区容量 134,217,728 字节。
+
+### 方式一：构建时自动重打包（默认，推荐）
+
+直接触发 `Build alioth kernel`，把 `repack` 留空或选 `auto`。第 11 步会自动 unpack → 替换 kernel → repack，产物 `boot.img` 与 `Image` 一起放在同一个 artifact 里。
+
+### 方式二：独立重打包工作流（复用已有产物，不重新编译）
 
 `Actions` → 左侧 `Repack boot.img (from an existing build)` → `Run workflow`：
 
 | 输入项 | 填什么 |
 |---|---|
-| `run_id` | 上一步 `Build alioth kernel` 那次**成功** Run 的 ID（Run 页面 URL 末尾的数字，如 `.../actions/runs/1234567890`） |
+| `run_id` | 某次**成功**的 `Build alioth kernel` Run ID（Run 页面 URL 末尾数字，如 `.../actions/runs/1234567890`） |
 | `base` | 留空（默认 `stock_boot.img`） |
 
-前提：仓库根目录已有 `stock_boot.img`。耗时约 **2 分钟**，产物名 `alioth-boot-img`。
+通过 `run-id` 直接复用那次 Run 的 artifact，**因此不需要重新编译内核**（省掉约 1 小时），耗时约 **2 分钟**，产物名 `alioth-boot-img`。
 
-> 这个工作流通过 `run-id` 直接复用上一次 Run 的 artifact，**因此不需要重新编译内核**（省掉约 1 小时）。
+### 方式三：本地重打包
 
-### 做法二：构建时自动重打包
+把 `Image` 和 `stock_boot.img` 放一起，用 Magisk 的 `magiskboot` 手工执行 `unpack` → 替换 `kernel` → `repack`。
 
-把原厂 `boot.img` 放进仓库根目录并命名为 **`stock_boot.img`**，然后**重新触发** `Build alioth kernel`（`repack` 选 `auto`）。工作流最后一步会自动 unpack / 替换 kernel / repack。
-
-缺点：要连带重编一遍内核。
-
-### 做法三：本地重打包
-
-把 `Image` 和原厂 `boot.img` 放一起，用 Magisk 的 `magiskboot` 手工执行 unpack → 替换 `kernel` → repack。
-
-> 三种做法产出的 boot.img 都**完整保留原厂分区头、ramdisk、cmdline、dtb 配置，只替换内核段**。
->
-> 原厂 `boot.img` 从哪来？线刷包 `alioth_images_OS1.0.10.0.TKHCNXM_*.tgz` 解开的 `images/boot.img`。
-> 仓库单文件上限 **100 MB**，boot.img 通常 64–96 MB，可以直接提交。
+> 三种方式产出的 boot.img 都**完整保留原厂分区头与 ramdisk，只替换内核段**。
 
 ---
 
@@ -252,12 +276,12 @@ your-magisk-module/
 ```
 ci-build/
 ├── .github/workflows/
-│   ├── build-alioth-kernel.yml                 编译内核（12 步，含校验闸门）
+│   ├── build-alioth-kernel.yml                 编译内核 + 自动重打包（12 步，含校验闸门）
 │   └── repack-bootimg.yml                      复用已有产物重打包 boot.img（8 步，约 2 分钟）
-├── .gitattributes                              强制 LF，防止 CRLF 污染 shell / Kconfig
+├── .gitattributes                              强制 LF + 标记 .img 为 binary，防止文本转换损坏镜像
 ├── config/docker-kernel.fragment               要补的 Docker 内核配置
-├── scripts/patch-module-compat.py              模块兼容补丁（已本地验证幂等 + 括号配对）
+├── scripts/patch-module-compat.py              模块兼容补丁（已用真实源码验证 + 幂等）
+├── stock_boot.img                              原厂 boot 镜像（裁剪至 70,438,912 字节）
+├── stock_boot.img.sha256                       完整性校验，工作流使用前强制核对
 └── README.md                                   本文件
 ```
-
-可选：`stock_boot.img`（原厂 boot 镜像，放进仓库根目录以启用重打包）

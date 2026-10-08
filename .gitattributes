@@ -1,2 +1,11 @@
-# 强制所有文本文件以 LF 存储，避免 Windows 上的 CRLF 污染 bash / Kconfig
+# 强制文本文件以 LF 存储，避免 Windows 上的 CRLF 污染 bash / Kconfig
 * text=auto eol=lf
+
+# 二进制文件：必须显式声明为 binary，禁止任何行尾转换
+# （boot 镜像是 Android boot image，被改写一个字节就会刷不开机）
+*.img    binary
+*.apk    binary
+*.so     binary
+*.ko     binary
+*.zip    binary
+*.gz     binary

@@ -32,14 +32,23 @@ jobs:
       - name: 检出本仓库（取 stock_boot.img）
         uses: actions/checkout@v4
 
-      - name: 校验基准镜像存在
+      - name: 校验基准镜像
         run: |
           set -eu
-          if [ ! -f "${{ github.event.inputs.base }}" ]; then
-            echo "::error:: 仓库根目录未找到 ${{ github.event.inputs.base }}"
+          BASE="${{ github.event.inputs.base }}"
+          if [ ! -f "$BASE" ]; then
+            echo "::error:: 仓库根目录未找到 $BASE"
             exit 1
           fi
-          ls -lh "${{ github.event.inputs.base }}"
+          ls -lh "$BASE"
+          # 默认基准镜像必须通过 SHA-256 校验（二进制损坏会直接导致刷不开机）
+          if [ "$BASE" = "stock_boot.img" ] && [ -f stock_boot.img.sha256 ]; then
+            sha256sum -c stock_boot.img.sha256
+            echo "基准镜像 SHA-256 校验通过"
+          elif [ "$BASE" = "stock_boot.img" ]; then
+            echo "::error:: 缺少 stock_boot.img.sha256，拒绝使用未校验的基准镜像"
+            exit 1
+          fi
 
       - name: 从指定 Run 下载编译产物
         uses: actions/download-artifact@v4
@@ -71,14 +80,35 @@ jobs:
           set -eux
           mkdir -p work && cd work
           cp "../${{ github.event.inputs.base }}" boot.img
+
+          echo "== 基准镜像自检 =="
+          head -c 8 boot.img | grep -q 'ANDROID!' || { echo "::error:: 基准镜像不是合法 Android boot image"; exit 1; }
+          stat -c '大小 %s 字节' boot.img
+
           ../mb/libmagiskboot.so unpack boot.img
           echo "== 解包结果 =="
           ls -l
-          echo "== 原厂内核大小 =="
-          ls -l kernel 2>/dev/null || echo "(无 kernel 段)"
+          echo "== 原厂内核段 =="
+          stat -c '%n  %s 字节' kernel 2>/dev/null || echo "(无 kernel 段)"
+
           cp ../artifacts/Image kernel
+          echo "== 新内核段 =="
+          stat -c '%n  %s 字节' kernel
+
           ../mb/libmagiskboot.so repack boot.img
+
+          echo "== 新 boot.img 校验 =="
+          head -c 8 new-boot.img | grep -q 'ANDROID!' || { echo "::error:: 重打包结果不是合法 Android boot image"; exit 1; }
+          NEWSZ=$(stat -c '%s' new-boot.img)
+          PART=134217728
+          echo "新镜像大小: $NEWSZ 字节   boot 分区大小: $PART 字节"
+          if [ "$NEWSZ" -gt "$PART" ]; then
+            echo "::error:: 新镜像超过 boot 分区容量，无法刷入"
+            exit 1
+          fi
           ls -lh new-boot.img
+          sha256sum new-boot.img
+
           mkdir -p ../out
           cp new-boot.img ../out/boot.img
 
