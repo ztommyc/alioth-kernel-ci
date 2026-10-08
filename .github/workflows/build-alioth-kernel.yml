@@ -28,7 +28,7 @@ on:
         required: false
         default: 'system14'
       ksu:
-        description: 'KernelSU 集成：no=不集成 / setup=克隆 ReSukiSU 并跑 setup.sh 生成 drivers/kernelsu（v4.19.296 等老树必需，否则 Kconfig 报缺文件）'
+        description: 'KernelSU 集成：no=不集成（仅新树可用）/ setup=克隆 ReSukiSU（仅新树可用，BakaSU 已不支持 4.19）/ stub=仅为老树创建占位 drivers/kernelsu/Kconfig（不做 root，专用于验证老内核树能否开机）'
         required: false
         default: 'no'
 
@@ -166,6 +166,32 @@ jobs:
           # 作者 2023 年发布时用的是老版 KernelSU，还没有这个检查。这里补上 KALLSYMS_ALL。
           grep -qx 'CONFIG_KALLSYMS_ALL=y' "arch/arm64/configs/$DEFCONFIG" \
             && echo "已为 BakaSU 静态导出检查补上 CONFIG_KALLSYMS_ALL=y ✅"
+
+      - name: 为老内核树创建 drivers/kernelsu 占位（ksu=stub，不做 root）
+        if: ${{ github.event.inputs.ksu == 'stub' }}
+        env:
+          DEFCONFIG: ${{ github.event.inputs.defconfig || 'alioth_defconfig' }}
+        run: |
+          set -eux
+          # 老内核树（v4.19.296 一系）的 drivers/Kconfig 里有
+          #   source "drivers/kernelsu/Kconfig"
+          # 该目录由 KernelSU 的 setup.sh 生成；一旦 ksu != setup，make <defconfig> 必报：
+          #   drivers/Kconfig:240: can't open file "drivers/kernelsu/Kconfig"
+          # 而我们不带 KSU 复刻老树（只为验证"老内核树能否开机"），
+          # 所以这里造一个最小占位 Kconfig/Kbuild/Makefile，把引用喂饱即可。
+          mkdir -p kernel-src/drivers/kernelsu
+          printf '%s\n' '# 占位（ksu=stub）：不提供任何 KernelSU 功能，仅为满足 drivers/Kconfig 的 source 引用。' > kernel-src/drivers/kernelsu/Kconfig
+          printf '%s\n' '# 占位（ksu=stub）' > kernel-src/drivers/kernelsu/Kbuild
+          printf '%s\n' '# 占位（ksu=stub）' > kernel-src/drivers/kernelsu/Makefile
+          # 老树 defconfig 里的 CONFIG_KSU* 在占位 Kconfig 中无定义，kconfig 会忽略之（非错误）。
+          # 但为干净起见，把 defconfig 里的 KSU 行注释掉，避免无意义告警。
+          cd kernel-src
+          sed -i 's/^\(CONFIG_KSU[A-Z_]*\)=/# \1=/' "arch/arm64/configs/$DEFCONFIG" || true
+          echo "== 占位结果 =="
+          ls -l drivers/kernelsu/
+          grep -n "kernelsu" drivers/Kconfig | head -3
+          echo "== defconfig 中剩余的 KSU 行（应为注释）=="
+          grep -n "KSU" "arch/arm64/configs/$DEFCONFIG" || echo "  （无）"
 
       - name: 应用模块兼容补丁
         if: ${{ github.event.inputs.mode != 'clean' }}
