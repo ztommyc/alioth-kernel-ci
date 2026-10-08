@@ -165,9 +165,19 @@ jobs:
         run: |
           set -eux
           cd kernel-src
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
+          # 原因：v4.19.296 一系的 Makefile 无条件写死
+          #   CC = $(PYTHON2) $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
+          # 而 scripts/gcc-wrapper.py 在该树里已被删除 →
+          #   python2: can't open file '../scripts/gcc-wrapper.py'
+          # → CC 版本探测失败 → CC_VERSION_TEXT 为空 → init/Kconfig:17 syntax error。
+          # make 的「命令行变量」优先级高于 Makefile 内的赋值，传 CC=clang 即可覆盖。
+          # （4.19.325 新树已加 wildcard 保护，所以不传也能过。）
+          make O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             ${{ github.event.inputs.defconfig || 'alioth_defconfig' }}
 
       - name: 合并 Docker 能力配置片段
@@ -177,9 +187,19 @@ jobs:
           cd kernel-src
           scripts/kconfig/merge_config.sh -m -O out out/.config \
             ../ci/config/docker-kernel.fragment
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
+          # 原因：v4.19.296 一系的 Makefile 无条件写死
+          #   CC = $(PYTHON2) $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
+          # 而 scripts/gcc-wrapper.py 在该树里已被删除 →
+          #   python2: can't open file '../scripts/gcc-wrapper.py'
+          # → CC 版本探测失败 → CC_VERSION_TEXT 为空 → init/Kconfig:17 syntax error。
+          # make 的「命令行变量」优先级高于 Makefile 内的赋值，传 CC=clang 即可覆盖。
+          # （4.19.325 新树已加 wildcard 保护，所以不传也能过。）
+          make O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
       - name: 配置校验闸门（关键项缺失则中止构建）
@@ -217,9 +237,19 @@ jobs:
         run: |
           set -eux
           cd kernel-src
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          # 必须显式传 CC=clang / LD=ld.lld（仿作者 zfdx123 的构建库）。
+          # 原因：v4.19.296 一系的 Makefile 无条件写死
+          #   CC = $(PYTHON2) $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
+          # 而 scripts/gcc-wrapper.py 在该树里已被删除 →
+          #   python2: can't open file '../scripts/gcc-wrapper.py'
+          # → CC 版本探测失败 → CC_VERSION_TEXT 为空 → init/Kconfig:17 syntax error。
+          # make 的「命令行变量」优先级高于 Makefile 内的赋值，传 CC=clang 即可覆盖。
+          # （4.19.325 新树已加 wildcard 保护，所以不传也能过。）
+          make O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             -j"$(nproc)"
 
       - name: 收集产物
@@ -236,9 +266,11 @@ jobs:
           # 只换内核不换 dtbo 会导致关键驱动（UFS/显示）起不来，卡在开机 logo。
           if [ ! -f out/arch/arm64/boot/dtbo.img ]; then
             echo "::warning:: 未发现 dtbo.img，尝试显式构建 dtbo.img"
-            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            make O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              CC=clang LD=ld.lld \
               CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_COMPAT=arm-linux-gnueabi- dtbo.img || true
+              CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- dtbo.img || true
           fi
           if [ ! -f out/arch/arm64/boot/dtbo.img ]; then
             echo "::error::未生成 dtbo.img —— 检查 CONFIG_BUILD_ARM64_DT_OVERLAY 与 DTS 是否参与编译"
