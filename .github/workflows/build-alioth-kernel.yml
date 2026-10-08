@@ -15,6 +15,10 @@ on:
         description: '是否用 stock_boot.img 重打包 boot.img (auto/yes/no)'
         required: false
         default: 'auto'
+      kernel_ref:
+        description: '内核树 commit（留空 = 使用已验证的锁定版本）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -49,12 +53,21 @@ jobs:
           echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
           "$HOME/llvm-bin/clang" --version | head -2 || clang-14 --version | head -2
 
-      - name: 克隆内核源码
+      - name: 克隆内核源码（锁定到已验证的 commit）
+        env:
+          KERNEL_REF: ${{ github.event.inputs.kernel_ref || '8b19a1dd26ae283a2bfc33781905255339aae485' }}
         run: |
           set -eux
-          git clone --depth 1 --branch master \
-            https://github.com/zfdx123/kernel_xiaomi_alioth.git kernel-src
+          # 锁定 commit 的原因：该内核树仍在活跃维护，master 会变动；
+          # 而 scripts/patch-module-compat.py 依赖内核源码的精确文本。
+          # 锁到已验证的 commit，补丁才能保证命中。
+          git init -q kernel-src
           cd kernel-src
+          git remote add origin https://github.com/zfdx123/kernel_xiaomi_alioth.git
+          git fetch -q --depth 1 origin "$KERNEL_REF"
+          git checkout -q FETCH_HEAD
+          echo "== 实际使用 commit =="
+          git rev-parse HEAD
           echo "== 内核版本 =="
           head -5 Makefile
 
@@ -62,9 +75,20 @@ jobs:
         run: |
           set -eux
           cd kernel-src
+          # 脚本自身会校验：①两处外科改动必须命中 ②补丁不得制造任何
+          # 无引用的静态函数（本内核 CONFIG_CC_WERROR=y，-Wunused-function 会直接
+          # 导致编译失败）③花括号平衡。任一不满足即以非 0 退出。
           python3 ../ci/scripts/patch-module-compat.py
-          echo "== 校验补丁已生效 =="
-          grep -n "alioth-docker-patch" kernel/module.c
+          echo "== 校验补丁标记（应有 2 处）=="
+          n=$(grep -c "alioth-docker-patch" kernel/module.c)
+          echo "找到 $n 处 alioth-docker-patch 标记"
+          test "$n" -ge 2
+          echo "== 确认拒绝性返回已移除 =="
+          if grep -q -- "-ENOEXEC;" kernel/module.c && grep -A3 "same_magic(modmagic" kernel/module.c | grep -q -- "-ENOEXEC;"; then
+            echo "::error:: check_modinfo 中仍存在 return -ENOEXEC，补丁未生效"
+            exit 1
+          fi
+          echo "OK"
 
       - name: 生成 base defconfig
         run: |

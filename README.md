@@ -9,7 +9,7 @@
 | 项目 | 内容 |
 |---|---|
 | 编译目标 | Redmi K40 / POCO F3 / Mi 11X（`alioth`），Android 13 / Non-GKI |
-| 内核源码 | `zfdx123/kernel_xiaomi_alioth`（Linux 4.19.325，CLO `LA.UM.9.12.r1-18500-SMxx50.QSSI14.0`，2026-06 仍在维护） |
+| 内核源码 | `zfdx123/kernel_xiaomi_alioth`（Linux 4.19.325，CLO `LA.UM.9.12.r1-18500-SMxx50.QSSI14.0`，2026-06 仍在维护）<br>**已锁定 commit `8b19a1dd26ae283a2bfc33781905255339aae485`**（原因见 ②） |
 | Root | **源码树已内置 ReSukiSU manual-hook**（`CONFIG_KSU_MANUAL_HOOK=y`），不需要再单独集成 KernelSU |
 | 要补的能力 | 原厂内核缺失 `CONFIG_PID_NS` / `CONFIG_CGROUP_DEVICE` 等 9 项 → 补齐后 `dockerd` 才能跑起来 |
 | 工具链 | Ubuntu 22.04 + clang-14（与 Android 13 内核所用的 clang-r450784d「clang 14.0.7」同主版本） |
@@ -43,9 +43,26 @@ CONFIG_POSIX_MQUEUE=y
 
 而我们要编的是 **4.19.325**，release 串必然不同 → vermagic 不匹配；原厂还开了 `CONFIG_MODVERSIONS=y`，符号 CRC 也几乎不可能一致 → **模块会全部加载失败**。
 
-补丁做两件事（整段替换函数体，不产生 unreachable code，因此不会撞上 `-Werror`）：
-- `check_modinfo()` → 跳过 vermagic 比对
-- `check_version()` → 跳过符号 CRC 比对
+补丁只做两处**外科式**改动，函数体完整保留：
+
+| 位置 | 改动 |
+|---|---|
+| `check_version()` 的 `bad_version:` 处 | `return 0` → `return 1`（CRC 不匹配不再拒绝） |
+| `check_modinfo()` 的 vermagic 不匹配分支 | 去掉 `return -ENOEXEC`，只降级记日志后继续 |
+
+**为什么不能"清空函数体"**：清空后，原调用点只在这两个函数内的三个静态函数会失去全部调用者 —— `check_modinfo_retpoline()`、`set_license()`、`resolve_rel_crc()`。而本内核树 Makefile：
+
+```
+KBUILD_CFLAGS := -Wall ...                                   (455 行，-Wall 含 -Wunused-function)
+KBUILD_CFLAGS += cc-disable-warning unused-but-set-variable  (780 行)
+KBUILD_CFLAGS += cc-disable-warning unused-const-variable    (782 行)
+```
+
+只关掉了 `unused-but-set-variable` / `unused-const-variable`，**没有关 `unused-function`**；而 `alioth_defconfig`（795 行）有 `CONFIG_CC_WERROR=y` 会加 `-Werror` ⇒ *defined but not used* 直接变成编译错误。外科改动让所有引用原样留存，从根上避开这个坑，同时 license/retpoline/out-of-tree taint 等原有行为也全部保持不变。
+
+脚本会自我校验：两处改动必须命中、补丁不得制造任何无引用的静态函数、花括号必须平衡 —— 任一不满足即以非 0 退出，让 CI 在 2 分钟内失败，而不是产出可疑的补丁。
+
+> 因此**内核树必须锁 commit**：该仓库 master 仍在维护，而外科改动依赖精确文本。工作流默认使用已验证的 `8b19a1dd…`，可用 `kernel_ref` 输入覆盖。
 
 > ⚠️ 这个补丁只能保证「能加载」。若结构体布局有差异仍可能异常。彻底解法见第 6 节「策略一」。
 
@@ -98,12 +115,13 @@ git push -u origin main
 |---|---|
 | `defconfig` | 留空即可（默认 `alioth_defconfig`） |
 | `repack` | 留空（默认 `auto`，没有 `stock_boot.img` 时会自动跳过重打包） |
+| `kernel_ref` | **留空**（使用已验证锁定的 commit；仅在需要换内核版本时填写其它 commit） |
 
 耗时约 **40–90 分钟**。
 
 ### 中途的配置校验闸门（重要）
 
-工作流在第 7 步会**逐项检查关键配置**，缺任何一项就**直接中止**，不会白等一小时：
+工作流在第 8 步会**逐项检查关键配置**，缺任何一项就**直接中止**，不会白等一小时：
 
 ```
 ===== 致命项（Docker 必需）=====
@@ -216,8 +234,11 @@ your-magisk-module/
 | 校验闸门报 `[FAIL]` | 片段没合并成功 | 检查 `ci/config/docker-kernel.fragment` 路径是否对上 |
 | 校验闸门报 `[FAIL]`，但片段看着没问题 | 片段是 CRLF 换行，被 Kconfig 当成非法值 | 仓库已带 `.gitattributes` 强制 LF；确认 push 前没被本地 `core.autocrlf` 转回 CRLF |
 | 日志里出现 `$'\r': command not found` | 同上，工作流脚本行尾带了 CR | 同上 |
-| 编译报 `unused variable` / `unreachable code` 且 `-Werror` | 补丁没生效 | 看第 4 步日志有没有打印 `函数体已替换` |
-| `clang: command not found` | 软链没建上 | 检查第 2 步日志里 `clang --version` 的输出 |
+| 第 5 步报「未找到预期原文」 | 内核树 commit 与补丁预期不符 | 检查 `kernel_ref` 是否被改过；留空即用已验证 commit |
+| 第 5 步报「补丁使以下静态函数失去全部调用者」 | 补丁改法退化成了清空函数体 | 不该发生；若出现请把日志发我 |
+| 编译报 `defined but not used` / `unused-function` 且 `-Werror` | 同上，补丁方式退回旧版 | 同上 |
+| 编译报 `unused variable` / `unreachable code` | 补丁没生效 | 看第 5 步日志有没有打印改动区域 |
+| `clang: command not found` | 软链没建上 | 检查第 3 步日志里 `clang --version` 的输出 |
 | 找不到 `Image` | 编译失败 | 往上翻找到第一个 `Error` 行 |
 | 刷入后卡 Logo | 内核与系统不匹配 | `fastboot set_active b` 回滚 |
 | 能开机但没 WiFi | 模块兼容问题 | 按第 6 节做策略一 |
